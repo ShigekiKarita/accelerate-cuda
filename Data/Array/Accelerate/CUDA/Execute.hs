@@ -224,9 +224,9 @@ executeOpenAcc (ExecAcc (FL () kernel more) !gamma !pacc) !aenv !stream
     awhile p f a = do
       nop <- liftIO Event.create                -- record event never call, so this is a functional no-op
       r   <- executeOpenAfun1 p aenv (Async nop a)
-      ok  <- indexArray r 0                     -- TLM TODO: memory manager should remember what is already on the host
-      if ok then awhile p f =<< executeOpenAfun1 f aenv (Async nop a)
-            else return a
+      peekArray r
+      if r ! Z then awhile p f =<< executeOpenAfun1 f aenv (Async nop a)
+               else return a
 
     -- get the extent of an embedded array
     extent :: Shape sh => ExecOpenAcc aenv (Array sh e) -> CIO sh

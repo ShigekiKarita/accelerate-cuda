@@ -189,6 +189,7 @@ useArray !ctx !mt !ad !n0 =
     unless exists $ do
       dst <- malloc ctx mt ad n
       transfer "useArray/malloc" bytes $ CUDA.pokeArray n src dst
+      markAsOnHostAndDevice ctx mt ad
 
 
 useArrayAsync
@@ -208,6 +209,7 @@ useArrayAsync !ctx !mt !ad !n0 !ms =
     unless exists $ do
       dst <- malloc ctx mt ad n
       transfer "useArrayAsync/malloc" bytes $ CUDA.pokeArrayAsync n src dst ms
+      markAsOnHostAndDevice ctx mt ad
 
 
 useDevicePtrs
@@ -260,6 +262,9 @@ copyArray !ctx !mt !from !to !n = do
   dst <- devicePtrsOfArrayData ctx mt to
   transfer "copyArrayAsync" (n * sizeOf (undefined :: b)) $
     CUDA.copyArrayAsync n src dst
+  --
+  markAsOnDevice ctx mt from
+  markAsOnDevice ctx mt to
 
 
 -- Copy data between two device arrays that exist in different contexts and/or
@@ -277,6 +282,9 @@ copyArrayPeer !mt !from !ctxSrc !to !ctxDst !n = do
   dst <- devicePtrsOfArrayData ctxDst mt to
   transfer "copyArrayPeer" (n * sizeOf (undefined :: b)) $
     CUDA.copyArrayPeer n src (deviceContext ctxSrc) dst (deviceContext ctxDst)
+  --
+  markAsOnDevice ctxSrc mt from
+  markAsOnDevice ctxDst mt to
 
 copyArrayPeerAsync
     :: forall e a b. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr b, Typeable a, Typeable b, Typeable e, Storable b)
@@ -291,6 +299,9 @@ copyArrayPeerAsync !mt !from !ctxSrc !to !ctxDst !n !st = do
   dst <- devicePtrsOfArrayData ctxDst mt to
   transfer "copyArrayPeerAsync" (n * sizeOf (undefined :: b)) $
     CUDA.copyArrayPeerAsync n src (deviceContext ctxSrc) dst (deviceContext ctxDst) st
+  --
+  markAsOnDevice ctxSrc mt from
+  markAsOnDevice ctxDst mt to
 
 
 -- Copy data from the device into the associated Accelerate host-side array
@@ -303,9 +314,9 @@ peekArray
     -> Int
     -> IO ()
 peekArray !ctx !mt !ad !n =
-  devicePtrsOfArrayData ctx mt ad >>= \src ->
-    transfer "peekArray" (n * sizeOf (undefined :: a)) $
-      CUDA.peekArray n src (ptrsOfArrayData ad)
+  transferArrayData ToHost "peekArray" (n * sizeOf (undefined :: a)) ctx mt ad $ \src ->
+    CUDA.peekArray n src (ptrsOfArrayData ad)
+
 
 peekArrayAsync
     :: forall e a. (ArrayElt e, ArrayPtrs e ~ Ptr a, DevicePtrs e ~ CUDA.DevicePtr a, Typeable a, Typeable e, Storable a)
@@ -316,9 +327,8 @@ peekArrayAsync
     -> Maybe CUDA.Stream
     -> IO ()
 peekArrayAsync !ctx !mt !ad !n !st =
-  devicePtrsOfArrayData ctx mt ad >>= \src ->
-    transfer "peekArrayAsync" (n * sizeOf (undefined :: a)) $
-      CUDA.peekArrayAsync n src (CUDA.HostPtr $ ptrsOfArrayData ad) st
+  transferArrayData ToHost "peekArrayAsync" (n * sizeOf (undefined :: a)) ctx mt ad $ \src ->
+    CUDA.peekArrayAsync n src (CUDA.HostPtr $ ptrsOfArrayData ad) st
 
 
 -- Copy data from an Accelerate array into the associated device array
@@ -331,8 +341,7 @@ pokeArray
     -> Int
     -> IO ()
 pokeArray !ctx !mt !ad !n =
-  devicePtrsOfArrayData ctx mt ad >>= \dst ->
-    transfer "pokeArray: " (n * sizeOf (undefined :: a)) $
+  transferArrayData ToDevice "pokeArray" (n * sizeOf (undefined :: a)) ctx mt ad $ \dst ->
       CUDA.pokeArray n (ptrsOfArrayData ad) dst
 
 pokeArrayAsync
@@ -344,9 +353,8 @@ pokeArrayAsync
     -> Maybe CUDA.Stream
     -> IO ()
 pokeArrayAsync !ctx !mt !ad !n !st =
-  devicePtrsOfArrayData ctx mt ad >>= \dst ->
-    transfer "pokeArrayAsync: " (n * sizeOf (undefined :: a)) $
-      CUDA.pokeArrayAsync n (CUDA.HostPtr $ ptrsOfArrayData ad) dst st
+  transferArrayData ToDevice "pokeArrayAsync" (n * sizeOf (undefined :: a)) ctx mt ad $ \dst ->
+    CUDA.pokeArrayAsync n (CUDA.HostPtr $ ptrsOfArrayData ad) dst st
 
 
 -- Marshal device pointers to arguments that can be passed to kernel invocation
@@ -414,6 +422,45 @@ advancePtrsOfArrayData
     -> DevicePtrs e
     -> DevicePtrs e
 advancePtrsOfArrayData !n !_ !ptr = CUDA.advanceDevPtr ptr n
+
+
+-- Transfer direction, indicating the location of the destination array.
+--
+data Transfer = ToHost | ToDevice
+
+-- Transfer data between host and device arrays. If the data is already marked
+-- as existing at the destination, nothing is done.
+--
+transferArrayData
+    :: (ArrayElt e, DevicePtrs e ~ CUDA.DevicePtr b, Typeable e, Typeable b)
+    => Transfer         -- transfer direction
+    -> String           -- description, for debugging
+    -> Int              -- transfer size in bytes, for debugging
+    -> Context
+    -> MemoryTable
+    -> ArrayData e
+    -> (DevicePtrs e -> IO ())
+    -> IO ()
+transferArrayData !dir name bytes !ctx !mt !ad !action = do
+  mv <- lookup' ctx mt ad
+  case mv of
+    Nothing -> do
+      sn <- makeStableName ad
+      INTERNAL_ERROR(error) "transferArrayData" $ "lost device memory #" ++ show (hashStableName sn)
+
+    Just (v, onHost, onDevice) -> do
+      case dir of
+        ToHost   | onHost       -> return ()
+        ToDevice | onDevice     -> return ()
+        _                       -> do
+
+          -- perform the transfer
+          transfer name bytes (action v)
+
+          -- update array meta-data
+          case dir of
+            ToHost      -> markAsOnHost   ctx mt ad
+            ToDevice    -> markAsOnDevice ctx mt ad
 
 
 -- Debug

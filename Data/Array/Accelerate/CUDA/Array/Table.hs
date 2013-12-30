@@ -17,7 +17,9 @@
 module Data.Array.Accelerate.CUDA.Array.Table (
 
   -- Tables for host/device memory associations
-  MemoryTable, new, lookup, malloc, insert, insertRemote, reclaim
+  MemoryTable, new, lookup, lookup', malloc, reclaim,
+  markAsOnHost, markAsOnDevice, markAsOnHostAndDevice,
+  insertRemote,
 
 ) where
 
@@ -82,6 +84,8 @@ data HostArray where
 data DeviceArray where
   DeviceArray :: Typeable e
               => {-# UNPACK #-} !(Weak (DevicePtr e))
+              -> !Bool                          -- data exists on the host?
+              -> !Bool                          -- data exists on the device?
               -> DeviceArray
 
 instance Eq HostArray where
@@ -97,8 +101,8 @@ instance Show HostArray where
   show (HostArray _ sn) = "Array #" ++ show (hashStableName sn)
 
 
--- Referencing arrays
--- ------------------
+-- Construction
+-- ------------
 
 -- Create a new hash table from host to device arrays. When the structure is
 -- collected it will finalise all entries in the table.
@@ -113,18 +117,29 @@ new = do
   return $! MemoryTable ref weak nrs
 
 
+-- Query
+-- -----
+
 -- Look for the device memory corresponding to a given host-side array.
 --
 lookup :: (Typeable a, Typeable b) => Context -> MemoryTable -> ArrayData a -> IO (Maybe (DevicePtr b))
-lookup ctx (MemoryTable !ref _ _) !arr = do
+lookup ctx mt arr = do
+  mp <- lookup' ctx mt arr
+  case mp of
+    Nothing      -> return Nothing
+    Just (p,_,_) -> return (Just p)
+
+
+lookup' :: (Typeable a, Typeable b) => Context -> MemoryTable -> ArrayData a -> IO (Maybe (DevicePtr b, Bool, Bool))
+lookup' ctx (MemoryTable !ref _ _) !arr = do
   sa <- makeStableArray ctx arr
   mw <- withMVar ref (`HT.lookup` sa)
   case mw of
-    Nothing              -> trace ("lookup/not found: " ++ show sa) $ return Nothing
-    Just (DeviceArray w) -> do
+    Nothing                     -> trace ("lookup/not found: " ++ show sa) $ return Nothing
+    Just (DeviceArray w h d)    -> do
       mv <- deRefWeak w
       case mv of
-        Just v | Just p <- gcast v -> trace ("lookup/found: " ++ show sa) $ return (Just p)
+        Just v | Just p <- gcast v -> trace ("lookup/found: " ++ show sa) $ return (Just (p,h,d))
                | otherwise         -> INTERNAL_ERROR(error) "lookup" $ "type mismatch"
 
         -- Note: [Weak pointer weirdness]
@@ -142,6 +157,9 @@ lookup ctx (MemoryTable !ref _ _) !arr = do
         Nothing                    ->
           makeStableArray ctx arr >>= \x -> INTERNAL_ERROR(error) "lookup" $ "dead weak pair: " ++ show x
 
+
+-- Insertion
+-- ---------
 
 -- Allocate a new device array to be associated with the given host-side array.
 -- This will attempt to use an old array from the nursery, but will otherwise
@@ -180,9 +198,9 @@ malloc !ctx mt@(MemoryTable _ _ !nursery) !ad !n = do
 insert :: (Typeable a, Typeable b) => Context -> MemoryTable -> ArrayData a -> DevicePtr b -> Int -> IO ()
 insert !ctx (MemoryTable !ref !weak_ref (Nursery _ !weak_nrs)) !arr !ptr !bytes = do
   key  <- makeStableArray ctx arr
-  dev  <- DeviceArray `fmap` mkWeak arr ptr (Just $ finalizer (weakContext ctx) weak_ref weak_nrs key ptr bytes)
+  weak <- mkWeak arr ptr (Just $ finalizer (weakContext ctx) weak_ref weak_nrs key ptr bytes)
   message      $ "insert: " ++ show key
-  withMVar ref $ \tbl -> HT.insert tbl key dev
+  withMVar ref $ \tbl -> HT.insert tbl key (DeviceArray weak False False)
 
 
 -- Record an association between a host-side array and a device memory area that was
@@ -192,13 +210,54 @@ insert !ctx (MemoryTable !ref !weak_ref (Nursery _ !weak_nrs)) !arr !ptr !bytes 
 insertRemote :: (Typeable a, Typeable b) => Context -> MemoryTable -> ArrayData a -> DevicePtr b -> IO ()
 insertRemote !ctx (MemoryTable !ref !weak_ref _) !arr !ptr = do
   key  <- makeStableArray ctx arr
-  dev  <- DeviceArray `fmap` mkWeak arr ptr (Just $ remoteFinalizer weak_ref key)
+  weak <- mkWeak arr ptr (Just $ remoteFinalizer weak_ref key)
   message      $ "insert/remote: " ++ show key
-  withMVar ref $ \tbl -> HT.insert tbl key dev
+  withMVar ref $ \tbl -> HT.insert tbl key (DeviceArray weak False True)        -- assume the device memory is valid
 
 
--- Removing entries
--- ----------------
+-- Updating
+-- --------
+
+markAsOnHost :: Typeable a => Context -> MemoryTable -> ArrayData a -> IO ()
+markAsOnHost !ctx !mt !arr = adjust ctx mt arr (\(DeviceArray w _ d) -> DeviceArray w True d)
+
+markAsOnDevice :: Typeable a => Context -> MemoryTable -> ArrayData a -> IO ()
+markAsOnDevice !ctx !mt !arr = adjust ctx mt arr (\(DeviceArray w h _) -> DeviceArray w h True)
+
+markAsOnHostAndDevice :: Typeable a => Context -> MemoryTable -> ArrayData a -> IO ()
+markAsOnHostAndDevice !ctx !mt !arr = adjust ctx mt arr (\(DeviceArray w _ _) -> DeviceArray w True True)
+
+
+-- Adjust a value at a specific key. If the key is not in the table, no change
+-- is made.
+--
+-- TLM: there may be a race condition between the lookup and update steps?
+--
+adjust :: Typeable a => Context -> MemoryTable -> ArrayData a -> (DeviceArray -> DeviceArray) -> IO ()
+adjust !ctx (MemoryTable !ref _ _) !arr !f = do
+  key   <- makeStableArray ctx arr
+  val   <- withMVar ref (`HT.lookup` key)
+  case val of
+    Nothing     -> return ()
+    Just d      -> withMVar ref $ \tbl -> HT.insert tbl key (f d)
+
+
+{--
+-- Alters the device memory associated with a host array, or absence thereof.
+-- This can be used to insert, delete, or update a value in the memory table.
+--
+alter :: Typeable a => Context -> (Maybe DeviceArray -> Maybe DeviceArray) -> ArrayData a -> MemoryTable -> IO ()
+alter !ctx !f !arr (MemoryTable !ref _ _) = do
+  key   <- makeStableArray ctx arr
+  val   <- withMVar ref (`HT.lookup` key)
+  case f val of
+    Nothing     -> maybe (return ()) (\(DeviceArray w _ _) -> finalize w) val
+    Just val'   -> withMVar ref $ \tbl -> HT.insert tbl key val'
+--}
+
+
+-- Deletion/Finalisation
+-- ---------------------
 
 -- Initiate garbage collection and finalise any arrays that have been marked as
 -- unreachable.
@@ -213,7 +272,7 @@ reclaim (MemoryTable _ weak_ref (Nursery nrs _)) = do
   case mr of
     Nothing  -> return ()
     Just ref -> withMVar ref $ \tbl ->
-      flip HT.mapM_ tbl $ \(_,DeviceArray w) -> do
+      flip HT.mapM_ tbl $ \(_,DeviceArray w _ _) -> do
         alive <- isJust `fmap` deRefWeak w
         unless alive $ finalize w
   --
@@ -222,6 +281,7 @@ reclaim (MemoryTable _ weak_ref (Nursery nrs _)) = do
     message $ "reclaim: freed "   ++ showBytes (fromIntegral (free - free'))
                         ++ ", "   ++ showBytes (fromIntegral free')
                         ++ " of " ++ showBytes (fromIntegral total) ++ " remaining"
+
 
 -- Because a finaliser might run at any time, we must reinstate the context in
 -- which the array was allocated before attempting to release it.
@@ -249,6 +309,7 @@ finalizer !weak_ctx !weak_ref !weak_nrs !key !ptr !bytes = do
         Nothing  -> trace ("finalise/free: "     ++ show key) $ bracket_ (CUDA.push ctx) CUDA.pop (CUDA.free ptr)
         Just nrs -> trace ("finalise/nursery: "  ++ show key) $ N.stash bytes ctx nrs ptr
 
+
 remoteFinalizer :: Weak MT -> HostArray -> IO ()
 remoteFinalizer !weak_ref !key = do
   mr <- deRefWeak weak_ref
@@ -256,10 +317,11 @@ remoteFinalizer !weak_ref !key = do
     Nothing  -> message ("finalise/dead table: " ++ show key)
     Just ref -> trace   ("finalise: "            ++ show key) $ withMVar ref (`HT.delete` key)
 
+
 table_finalizer :: HashTable HostArray DeviceArray -> IO ()
 table_finalizer !tbl
   = trace "table finaliser"
-  $ HT.mapM_ (\(_,DeviceArray w) -> finalize w) tbl
+  $ HT.mapM_ (\(_,DeviceArray w _ _) -> finalize w) tbl
 
 
 -- Miscellaneous
