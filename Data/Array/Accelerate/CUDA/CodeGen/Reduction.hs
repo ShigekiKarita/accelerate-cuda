@@ -146,9 +146,6 @@ mkFoldAll' recursive dev aenv fun@(CUFun2 _ _ combine) mseed (CUDelayed (CUExp s
          */
         if ( ix < shapeSize )
         {
-            /*
-             * Initialise the local sum, then ...
-             */
             $items:(y .=. get ix)
 
             /*
@@ -763,4 +760,3 @@ reduceBlockShfl dev fun x0 x1 sdata n
                  $item:(reduceWarpShfl dev fun x0 x1 n (cvar "threadIdx.x"))
              } |]
   : []
-
